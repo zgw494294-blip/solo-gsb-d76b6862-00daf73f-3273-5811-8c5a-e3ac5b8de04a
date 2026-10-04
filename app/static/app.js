@@ -463,13 +463,19 @@ archiveSaveBtn.addEventListener("click", async () => {
   }
 });
 
-// 冲突横幅上的「读取最新版本」：只读取版本与提示，不覆盖本地稿、不自动恢复
+// 冲突横幅上的「读取最新版本」：只读取版本与提示，不覆盖本地稿、不自动恢复。
+// 整个读取动作归属发起时的草稿世代：等待期间重新导入或恢复存档会推进世代，
+// 旧读取随即失效——其成功、失败与收尾一律落空，不得改动新稿的正文、版本、
+// 未存档标记、冲突、提示、错误或按钮状态（否则旧成功会回退新稿已取得的版本，
+// 使再次保存遭遇不必要的 409；旧失败会在新稿上误显示错误）
 archiveBanner.addEventListener("click", async (ev) => {
   const btn = ev.target.closest('[data-action="archive-read-latest"]');
   if (!btn) return;
+  const epoch = state.epoch;
   btn.disabled = true;
   try {
     const data = await api("/api/archive", null, "GET");
+    if (epoch !== state.epoch) return; // 已换稿：旧读取结果不得作用于新稿
     if (typeof data.version !== "number") throw new Error("bad archive read");
     state.archiveVersion = data.version;
     state.archiveConflict = null;
@@ -479,6 +485,7 @@ archiveBanner.addEventListener("click", async (ev) => {
         `或点「恢复存档」用服务端存档替换本地稿。`
       : "服务端存档当前为空，可直接保存当前草稿。";
   } catch (e) {
+    if (epoch !== state.epoch) return; // 已换稿：旧读取的失败不在新稿上提示
     state.archiveError = errorList(e);
   }
   syncArchiveUi();
