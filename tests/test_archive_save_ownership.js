@@ -1,14 +1,21 @@
 "use strict";
 
-// 前端「保存存档」请求归属的回归测试。
+// 前端存档请求归属的回归测试。
 //
-// 背景：首次保存（尚未取得版本）会先发 GET /api/archive 预读取槽内版本，再据此 PUT。
+// 背景一：首次保存（尚未取得版本）会先发 GET /api/archive 预读取槽内版本，再据此 PUT。
 // 若预读取延迟期间确认重新导入（或随后恢复存档并修改），旧保存动作必须失效：
 // 迟到的预读取无论成功、失败还是收尾，都不得触发后续 PUT，也不得改动新稿的版本、
 // 未存档标记、提示或新一次保存的等待状态。
 //
+// 背景二：保存遇 409 后，冲突横幅上的「读取最新版本」会发 GET /api/archive。
+// 若该读取等待期间确认重新导入或成功恢复存档（草稿世代推进），旧读取的成功、失败与
+// 收尾同样必须落空——成功响应不得把新稿有效取得的版本顶回旧版本（否则再次保存会遭遇
+// 无谓的 409），失败响应也不得在新稿上显示错误；同稿读取则只更新版本与提示，不替换
+// 正文、不自动保存。
+//
 // 本文件用最小 DOM 桩在 Node 虚拟机中加载真实的 app/static/app.js（不修改它），
-// 直接驱动「保存存档 / 重新导入 / 恢复存档」的真实事件处理器，fetch 由测试逐个收尾。
+// 直接驱动「保存存档 / 读取最新版本 / 重新导入 / 恢复存档」的真实事件处理器，
+// fetch 由测试逐个收尾。
 // 运行：node --test tests/test_archive_save_ownership.js（无第三方依赖）
 
 const test = require("node:test");
@@ -292,4 +299,298 @@ test("保存期间改稿：回执只确认提交时的快照，此后修改仍�
   assert.equal(app.state.archiveDirty, true, "保存期间的修改仍标为未存档");
   assert.match(app.state.archiveNotice, /提交时的快照/);
   assert.equal(app.state.archiving, false);
+});
+
+// --------------------------------------------------------------------------- //
+// 「读取最新版本」的驱动助手
+// --------------------------------------------------------------------------- //
+// 首次保存完整走通一次（预读取空槽 → PUT），随后制造一次保存冲突（409），
+// 返回冲突横幅的「读取最新版本」点击处理器被触发后的 Promise（其 GET 保持挂起）。
+async function saveOnceThenConflict(app) {
+  let save = app.$el("#archive-save-btn").fire("click");
+  await flush();
+  app.fetch.archiveGets()[0].respond(200, { version: 0, snapshot: null });
+  await flush();
+  app.fetch.archivePuts()[0].respond(200, { version: 1 });
+  await save;
+  await flush();
+  assert.equal(app.state.archiveVersion, 1);
+
+  app.touch(); // 改稿后再次保存：携带 v1 但服务端已到 v2，触发 409 冲突横幅
+  const putsBefore = app.fetch.archivePuts().length;
+  save = app.$el("#archive-save-btn").fire("click");
+  await flush();
+  assert.equal(app.fetch.archivePuts().length, putsBefore + 1);
+  app.fetch
+    .archivePuts()
+    [putsBefore].respond(409, { detail: { errors: ["存档版本冲突"], version: 2 } });
+  await save;
+  await flush();
+  assert.equal(app.state.archiveConflict, 2);
+  assert.equal(app.state.archiveVersion, 1, "409 不改动本地版本知识");
+}
+
+// 点击冲突横幅上的「读取最新版本」（DOM 桩中 closest 返回按钮自身）
+function clickReadLatest(app) {
+  const banner = app.$el("#archive-banner");
+  const btn = { closest: (sel) => (sel === '[data-action="archive-read-latest"]' ? btn : null) };
+  return banner.fire("click", { target: btn });
+}
+
+// --------------------------------------------------------------------------- //
+// 「读取最新版本」迟到成功：换稿（重新导入 → 恢复并修改）后旧成功不得回退新稿版本
+// --------------------------------------------------------------------------- //
+test("读取最新版本迟到成功：换稿后旧成功不改新稿任何存档状态，再保存用新稿版本且无无谓 409", async () => {
+  const app = loadApp();
+  await importDoc(app, "1|第一条\n2|第二条 [[1]]");
+  await saveOnceThenConflict(app);
+
+  // 点「读取最新版本」：GET 保持挂起（模拟读取延迟）
+  const readDone = clickReadLatest(app);
+  await flush();
+  const staleGet = app.fetch.archiveGets()[app.fetch.archiveGets().length - 1];
+
+  // 等待期间确认重新导入：世代推进
+  await app.$el("#reimport-btn").fire("click");
+  await flush();
+
+  // 再恢复较新存档（恢复自身的读取正常返回），随后修改新稿
+  const restoreDone = app.$el("#archive-restore-import-btn").fire("click");
+  await flush();
+  app.fetch.archiveGets()[app.fetch.archiveGets().length - 1].respond(200, {
+    version: 4,
+    snapshot: STORED_SNAPSHOT,
+  });
+  await restoreDone;
+  await flush();
+  assert.equal(app.state.archiveVersion, 4);
+  assert.equal(app.state.archiveDirty, false);
+  assert.deepEqual(app.state.orderIds, ["c1", "c2"]);
+  assert.equal(app.state.clauses[0].body, "存档第一条");
+  app.touch(); // 恢复后修改：标为未存档
+  assert.equal(app.state.archiveDirty, true);
+
+  // 旧读取此时才成功（返回旧版本 2）：成功与收尾一律落空
+  staleGet.respond(200, { version: 2, snapshot: null });
+  await readDone;
+  await flush();
+
+  assert.equal(app.state.archiveVersion, 4, "旧成功不得回退新稿有效取得的版本");
+  assert.equal(app.state.archiveDirty, true, "不得清掉新稿的未存档标记");
+  assert.equal(app.state.archiveConflict, null, "不得在新稿上设置冲突");
+  assert.equal(app.state.archiveError, null, "不得在新稿上留下错误");
+  assert.equal(app.state.archiveNotice, null, "不得在新稿上留下提示");
+  assert.equal(app.state.clauses[0].body, "存档第一条", "不得替换新稿正文");
+  const banner = app.$el("#archive-banner");
+  assert.equal(banner.hidden, true, "不得重绘新稿横幅");
+
+  // 再次保存必须沿用新稿版本 4：一次成功（旧代码会因版本被顶成 2 而先吃一次 409）
+  const putsBefore = app.fetch.archivePuts().length;
+  const resave = app.$el("#archive-save-btn").fire("click");
+  await flush();
+  assert.equal(
+    app.fetch.archivePuts().length,
+    putsBefore + 1,
+    "再次保存应直接 PUT（沿用版本 4），不重复预读取",
+  );
+  const resavePut = app.fetch.archivePuts()[putsBefore];
+  assert.equal(resavePut.body.version, 4);
+  resavePut.respond(200, { version: 5 });
+  await resave;
+  await flush();
+  assert.equal(app.state.archiveVersion, 5);
+  assert.equal(app.state.archiveDirty, false, "再次保存成功，未遭遇无谓 409");
+});
+
+// --------------------------------------------------------------------------- //
+// 「读取最新版本」迟到失败：换稿后旧失败不得在新稿上显示错误
+// --------------------------------------------------------------------------- //
+test("读取最新版本迟到失败：换稿后旧失败不提示、不改新稿任何存档状态", async () => {
+  const app = loadApp();
+  await importDoc(app, "1|第一条\n2|第二条 [[1]]");
+  await saveOnceThenConflict(app);
+
+  const readDone = clickReadLatest(app);
+  await flush();
+  const staleGet = app.fetch.archiveGets()[app.fetch.archiveGets().length - 1];
+
+  await app.$el("#reimport-btn").fire("click");
+  await flush();
+  const restoreDone = app.$el("#archive-restore-import-btn").fire("click");
+  await flush();
+  app.fetch.archiveGets()[app.fetch.archiveGets().length - 1].respond(200, {
+    version: 4,
+    snapshot: STORED_SNAPSHOT,
+  });
+  await restoreDone;
+  await flush();
+  app.touch(); // 恢复后修改新稿
+
+  // 旧读取此时才失败：失败与收尾一律落空
+  staleGet.fail(new TypeError("network down"));
+  await readDone;
+  await flush();
+
+  assert.equal(app.state.archiveVersion, 4, "旧失败不得改动新稿版本");
+  assert.equal(app.state.archiveDirty, true, "旧失败不得改动未存档标记");
+  assert.equal(app.state.archiveConflict, null);
+  assert.equal(app.state.archiveError, null, "旧失败不得在新稿上显示错误");
+  assert.equal(app.state.archiveNotice, null);
+  assert.equal(app.$el("#archive-banner").hidden, true, "不得重绘新稿横幅");
+});
+
+// --------------------------------------------------------------------------- //
+// 新保存等待期间旧读取返回（成功 / 失败）：不得解除新保存的等待状态
+// --------------------------------------------------------------------------- //
+test("换稿后再次保存等待中：旧读取成功不回退版本、不解除新保存等待，新保存正常成功", async () => {
+  const app = loadApp();
+  await importDoc(app, "1|第一条\n2|第二条 [[1]]");
+  await saveOnceThenConflict(app);
+
+  const readDone = clickReadLatest(app);
+  await flush();
+  const staleGet = app.fetch.archiveGets()[app.fetch.archiveGets().length - 1];
+
+  // 等待期间重新导入并导入新稿（新稿无需预读取：换稿复位后由恢复建立版本知识）
+  await app.$el("#reimport-btn").fire("click");
+  await flush();
+  const restoreDone = app.$el("#archive-restore-import-btn").fire("click");
+  await flush();
+  app.fetch.archiveGets()[app.fetch.archiveGets().length - 1].respond(200, {
+    version: 2,
+    snapshot: STORED_SNAPSHOT,
+  });
+  await restoreDone;
+  await flush();
+  app.touch(); // 修改新稿后再次保存：直接携带新稿版本 2 发 PUT
+  const putsBefore = app.fetch.archivePuts().length;
+  const save = app.$el("#archive-save-btn").fire("click");
+  await flush();
+  assert.equal(app.state.archiving, true);
+  assert.equal(app.fetch.archivePuts().length, putsBefore + 1);
+  const newPut = app.fetch.archivePuts()[putsBefore];
+  assert.equal(newPut.body.version, 2);
+
+  // 旧读取此时才成功（旧版本）：不得解除新保存等待、不得回退版本
+  staleGet.respond(200, { version: 2, snapshot: null });
+  await readDone;
+  await flush();
+  assert.equal(app.state.archiving, true, "旧读取成功不得解除新保存的等待状态");
+  assert.equal(app.state.archiveVersion, 2, "旧读取不得回退新稿版本");
+  assert.equal(app.state.archiveError, null);
+  assert.equal(app.state.archiveNotice, null);
+
+  // 新保存沿用版本 2 一次成功，无无谓 409
+  newPut.respond(200, { version: 3 });
+  await save;
+  await flush();
+  assert.equal(app.state.archiveVersion, 3);
+  assert.equal(app.state.archiveDirty, false);
+  assert.equal(app.state.archiving, false);
+});
+
+test("换稿后再次保存等待中：旧读取失败不提示、不解除新保存等待", async () => {
+  const app = loadApp();
+  await importDoc(app, "1|第一条\n2|第二条 [[1]]");
+  await saveOnceThenConflict(app);
+
+  const readDone = clickReadLatest(app);
+  await flush();
+  const staleGet = app.fetch.archiveGets()[app.fetch.archiveGets().length - 1];
+
+  await app.$el("#reimport-btn").fire("click");
+  await flush();
+  const restoreDone = app.$el("#archive-restore-import-btn").fire("click");
+  await flush();
+  app.fetch.archiveGets()[app.fetch.archiveGets().length - 1].respond(200, {
+    version: 2,
+    snapshot: STORED_SNAPSHOT,
+  });
+  await restoreDone;
+  await flush();
+  app.touch();
+  const putsBefore = app.fetch.archivePuts().length;
+  const save = app.$el("#archive-save-btn").fire("click");
+  await flush();
+  assert.equal(app.state.archiving, true);
+  const newPut = app.fetch.archivePuts()[putsBefore];
+
+  // 旧读取此时才失败：不在新稿提示，也不解除新保存的等待状态
+  staleGet.fail(new TypeError("network down"));
+  await readDone;
+  await flush();
+  assert.equal(app.state.archiving, true, "旧读取失败不得解除新保存的等待状态");
+  assert.equal(app.state.archiveError, null, "旧读取失败不得在新稿上提示");
+  assert.equal(app.state.archiveVersion, 2);
+
+  newPut.respond(200, { version: 3 });
+  await save;
+  await flush();
+  assert.equal(app.state.archiveVersion, 3);
+  assert.equal(app.state.archiveDirty, false);
+});
+
+// --------------------------------------------------------------------------- //
+// 同稿读取（正常冲突流程）：只更新版本与提示，不替换正文、不自动保存；再保存沿用新读版本
+// --------------------------------------------------------------------------- //
+test("正常冲突后读取最新版本再保存：不替换正文、不自动保存，PUT 沿用读到的版本", async () => {
+  const app = loadApp();
+  await importDoc(app, "1|第一条\n2|第二条 [[1]]");
+  await saveOnceThenConflict(app);
+  assert.equal(app.state.clauses[0].body, "甲方在七日内交付设备");
+  const putsAfterConflict = app.fetch.archivePuts().length;
+
+  // 同稿读取成功（服务端 v2 有快照）：只更新版本与提示
+  const readDone = clickReadLatest(app);
+  await flush();
+  app.fetch
+    .archiveGets()
+    [app.fetch.archiveGets().length - 1].respond(200, { version: 2, snapshot: STORED_SNAPSHOT });
+  await readDone;
+  await flush();
+
+  assert.equal(app.state.archiveVersion, 2, "同稿读取更新版本知识");
+  assert.equal(app.state.archiveConflict, null, "读取后冲突解除");
+  assert.equal(app.state.archiveError, null);
+  assert.match(app.state.archiveNotice, /版本 2/);
+  assert.equal(
+    app.state.clauses[0].body,
+    "甲方在七日内交付设备",
+    "读取不替换本地正文",
+  );
+  assert.equal(app.state.archiveDirty, true, "读取不改变未存档标记");
+  assert.equal(
+    app.fetch.archivePuts().length,
+    putsAfterConflict,
+    "读取不触发自动保存",
+  );
+
+  // 再保存沿用读到的版本 2，一次成功
+  const save = app.$el("#archive-save-btn").fire("click");
+  await flush();
+  assert.equal(app.fetch.archivePuts().length, putsAfterConflict + 1);
+  const put = app.fetch.archivePuts()[putsAfterConflict];
+  assert.equal(put.body.version, 2);
+  put.respond(200, { version: 3 });
+  await save;
+  await flush();
+  assert.equal(app.state.archiveVersion, 3);
+  assert.equal(app.state.archiveDirty, false);
+});
+
+test("正常冲突后读取失败：错误显示在横幅上，本地稿与版本知识不变，可再次操作", async () => {
+  const app = loadApp();
+  await importDoc(app, "1|第一条\n2|第二条 [[1]]");
+  await saveOnceThenConflict(app);
+
+  const readDone = clickReadLatest(app);
+  await flush();
+  app.fetch.archiveGets()[app.fetch.archiveGets().length - 1].fail(new TypeError("network down"));
+  await readDone;
+  await flush();
+
+  assert.equal(app.state.archiveVersion, 1, "读取失败不改动版本知识");
+  assert.equal(app.state.archiveConflict, 2, "读取失败不清掉冲突（仍可再点读取）");
+  assert.ok(app.state.archiveError, "同稿读取失败应显示错误");
+  assert.equal(app.state.archiveDirty, true);
 });
